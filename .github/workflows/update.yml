@@ -1,0 +1,126 @@
+name: J results robot
+
+on:
+  schedule:
+    - cron: '47 13 * * *'
+    - cron: '23 15 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch latest results
+        run: |
+          python3 - <<'PY'
+          import re, sys, html, datetime as dt, urllib.request
+
+          UA = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36'}
+          OPS = ['Magnum', 'Sports Toto', 'Da Ma Cai', 'Singapore Pools']
+          NAMES = [('Magnum Jackpot Gold', None), ('Jackpot Gold', None), ('Magnum Life', None), ('Magnum', 'Magnum'),
+                   ('Sports Toto', 'Sports Toto'), ('Damacai', 'Da Ma Cai'), ('Da Ma Cai', 'Da Ma Cai'),
+                   ('Singapore 4D', 'Singapore Pools'), ('Sandakan', None), ('CashSweep', None), ('Diriwan', None),
+                   ('Grand Dragon', None), ('Lotto', None), ('3D', None), ('5D', None), ('6D', None), ('Perdana', None),
+                   ('Hari Hari', None), ('Cambodia', None)]
+
+          def get(url):
+              req = urllib.request.Request(url, headers=UA)
+              with urllib.request.urlopen(req, timeout=30) as r:
+                  return r.read().decode('utf-8', 'replace')
+
+          def text_of(page):
+              page = re.sub(r'(?is)<(script|style).*?</\1>', ' ', page)
+              page = re.sub(r'<[^>]+>', ' ', page)
+              return re.sub(r'\s+', ' ', html.unescape(page))
+
+          def heading(tail):
+              best = None
+              for name, op in NAMES:
+                  i = tail.rfind(name)
+                  if i >= 0:
+                      key = (i, len(name))
+                      if best is None or key > best[0]:
+                          best = (key, op)
+              return best[1] if best else None
+
+          def parse_4d(txt, date):
+              want = date.strftime('%d-%m-%Y')
+              parts = txt.split('Draw Date:')
+              out = {}
+              for k in range(1, len(parts)):
+                  op = heading(parts[k - 1][-80:])
+                  body = parts[k]
+                  if not op or op in out or not body.strip().startswith(want):
+                      continue
+                  m = re.search(r'1st Prize\s*(\d{4})(?!\d).*?2nd Prize\s*(\d{4})(?!\d).*?3rd Prize\s*(\d{4})(?!\d)', body)
+                  if not m or 'Special' not in body or 'Consolation' not in body:
+                      continue
+                  sp = body[body.index('Special', m.end()):]
+                  sp, co = sp.split('Consolation', 1)
+                  sp_real = [t for t in re.findall(r'(?<![\d*-])(\d{4}|-{4}|\*{4})(?![\d*-])', sp) if t.isdigit()][:10]
+                  cons = re.findall(r'(?<!\d)\d{4}(?!\d)', co)[:10]
+                  if len(sp_real) < 5 or len(cons) != 10:
+                      continue
+                  sp_real += ['----'] * (10 - len(sp_real))
+                  out[op] = [date.isoformat(), op, *m.groups(), *sp_real, *cons]
+              return out
+
+          def parse_toto(txt):
+              res = {}
+              pat = r'(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\s+(\d{1,2} [A-Z][a-z]{2} \d{4})\s+((?:\d{1,2}\s+){6}\d{1,2})(?!\d)'
+              for d, nums in re.findall(pat, txt):
+                  n = [int(x) for x in nums.split()]
+                  if len(set(n)) == 7 and all(1 <= x <= 49 for x in n):
+                      day = dt.datetime.strptime(d, '%d %b %Y').date().isoformat()
+                      res.setdefault(day, [day] + [str(x) for x in sorted(n[:6])] + [str(n[6])])
+              return res
+
+          def main():
+              today = (dt.datetime.utcnow() + dt.timedelta(hours=8)).date()
+              lines = open('data.csv').read().strip().split('\n')
+              have = {(l.split(',')[0], l.split(',')[1]) for l in lines if l[:2] == '20'}
+              added = 0
+              for back in range(0, 8):
+                  d = today - dt.timedelta(days=back)
+                  if all((d.isoformat(), op) in have for op in OPS):
+                      continue
+                  try:
+                      got = parse_4d(text_of(get('https://www.4dkingdom.com/past-results/' + d.isoformat())), d)
+                  except Exception as e:
+                      print('4D', d, 'fetch failed:', e); continue
+                  for op, row in got.items():
+                      if (d.isoformat(), op) not in have and len(row) == 25:
+                          lines.append(','.join(row)); have.add((d.isoformat(), op)); added += 1
+                          print('added 4D', d, op)
+              hdr = [l for l in lines if l[:2] != '20']
+              rows = sorted(set(l for l in lines if l[:2] == '20'), key=lambda l: (l.split(',')[0], l.split(',')[1]))
+              open('data.csv', 'w').write('\n'.join(hdr + rows) + '\n')
+
+              tl = open('toto.csv').read().strip().split('\n')
+              thave = {l.split(',')[0] for l in tl}
+              try:
+                  tg = parse_toto(text_of(get('https://lotteryguru.com/singapore-lottery-results/sg-toto/sg-toto-results-history')))
+              except Exception as e:
+                  print('Toto fetch failed:', e); tg = {}
+              for day, row in tg.items():
+                  if day not in thave and day > max(thave):
+                      tl.append(','.join(row)); added += 1; print('added Toto', day)
+              th = [l for l in tl if l[:2] != '20']
+              tr = sorted(set(l for l in tl if l[:2] == '20'))
+              open('toto.csv', 'w').write('\n'.join(th + tr) + '\n')
+              print('new results:', added)
+
+          if __name__ == '__main__':
+              main()
+
+          PY
+      - name: Save if anything new
+        run: |
+          git config user.name "J robot"
+          git config user.email "robot@users.noreply.github.com"
+          git add data.csv toto.csv
+          git diff --cached --quiet && echo "No new results" || (git commit -m "Auto-update results" && git push)
